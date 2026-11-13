@@ -1,0 +1,83 @@
+# <org>.github.io (PUBLIC) - the "Promote dev to prod" button.
+# Lives in a public repo because free-plan required reviewers only work on public repos.
+# Flow: approve -> pull dev code -> record release in wcarc-site (private) -> publish here -> deploy Pages.
+name: Promote dev to prod
+run-name: Promote dev@${{ inputs.ref }} to prod (${{ github.actor }})
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Dev branch, tag, or commit to promote
+        required: true
+        default: main
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+concurrency:
+  group: promote-prod
+  cancel-in-progress: false
+jobs:
+  promote:
+    name: Approve and promote
+    runs-on: ubuntu-latest
+    environment: production          # approval gate (required reviewers)
+    env:
+      ORG: ${{ github.repository_owner }}
+      REF: ${{ inputs.ref }}
+    steps:
+      - name: Fetch dev code
+        env:
+          KEY: ${{ secrets.DEV_CODE_DEPLOY_KEY }}
+        run: |
+          printf '%s\n' "$KEY" > "$RUNNER_TEMP/dev_key" && chmod 600 "$RUNNER_TEMP/dev_key"
+          export GIT_SSH_COMMAND="ssh -i $RUNNER_TEMP/dev_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+          git clone -q "git@github.com:${ORG}/wcarc-site-dev.git" dev
+          git -C dev checkout -q --detach "origin/$REF" 2>/dev/null || git -C dev checkout -q --detach "$REF"
+          test -f dev/site/index.html || { echo "::error::site/index.html missing at $REF"; exit 1; }
+          echo "DEV_SHA=$(git -C dev rev-parse --short HEAD)" >> "$GITHUB_ENV"
+      - name: Record release in prod code repo
+        env:
+          KEY: ${{ secrets.PROD_CODE_DEPLOY_KEY }}
+        run: |
+          printf '%s\n' "$KEY" > "$RUNNER_TEMP/prod_key" && chmod 600 "$RUNNER_TEMP/prod_key"
+          export GIT_SSH_COMMAND="ssh -i $RUNNER_TEMP/prod_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+          git clone -q "git@github.com:${ORG}/wcarc-site.git" prodcode
+          rsync -a --delete --exclude '.git/' --exclude '.github/' --exclude 'README.md' dev/ prodcode/
+          cd prodcode
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Prod code already matches dev@${DEV_SHA}"
+          else
+            git commit -q -m "Release dev@${DEV_SHA} (promoted by ${GITHUB_ACTOR}, run ${GITHUB_RUN_ID})"
+            git tag "release-$(date -u +%Y%m%d-%H%M%S)"
+            git push -q origin HEAD --tags
+          fi
+      - uses: actions/checkout@v4
+        with:
+          path: pages
+      - name: Update published files
+        run: |
+          rsync -a --delete --exclude '.git/' --exclude '.github/' --exclude 'README.md' dev/site/ pages/
+          touch pages/.nojekyll
+          cd pages
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then echo "Published files unchanged"; else git commit -q -m "Publish dev@${DEV_SHA}"; git push -q; fi
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: pages
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: promote
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
